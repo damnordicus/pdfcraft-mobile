@@ -11,6 +11,7 @@ import uniffi.pdfcraft_mobile_ffi.MobileDocument
 import uniffi.pdfcraft_mobile_ffi.MobileException
 import uniffi.pdfcraft_mobile_ffi.OutlineEntry
 import uniffi.pdfcraft_mobile_ffi.SearchMatch
+import uniffi.pdfcraft_mobile_ffi.TextSelection
 
 /** Device pixels per PDF point for both page rendering and search highlight rects — they must
  * match, or a match's rects won't line up with the bitmap they're drawn onto. */
@@ -31,6 +32,9 @@ sealed interface PdfState {
         val outline: List<OutlineEntry>,
         val matches: List<SearchMatch> = emptyList(),
         val matchIndex: Int = -1,
+        /** A word or drag-extended text selection on the current page; page-local, cleared on
+         * navigation. Null when nothing is selected. */
+        val selection: TextSelection? = null,
     ) : PdfState {
         val activeMatch: SearchMatch?
             get() = matches.getOrNull(matchIndex)
@@ -69,7 +73,7 @@ class PdfViewModel : ViewModel() {
     fun goToPage(page: Int) {
         val loaded = state as? PdfState.Loaded ?: return
         if (page in 0 until loaded.pageCount) {
-            state = loaded.copy(page = page)
+            state = loaded.copy(page = page, selection = null)
         }
     }
 
@@ -87,7 +91,7 @@ class PdfViewModel : ViewModel() {
                 if (found.isEmpty()) {
                     current.copy(matches = emptyList(), matchIndex = -1)
                 } else {
-                    current.copy(matches = found, matchIndex = 0, page = found[0].page.toInt())
+                    current.copy(matches = found, matchIndex = 0, page = found[0].page.toInt(), selection = null)
                 }
         }
     }
@@ -100,7 +104,12 @@ class PdfViewModel : ViewModel() {
         val loaded = state as? PdfState.Loaded ?: return
         if (loaded.matches.isEmpty()) return
         val next = (loaded.matchIndex + delta).mod(loaded.matches.size)
-        state = loaded.copy(matchIndex = next, page = loaded.matches[next].page.toInt())
+        state = loaded.copy(matchIndex = next, page = loaded.matches[next].page.toInt(), selection = null)
+    }
+
+    fun setSelection(selection: TextSelection?) {
+        val loaded = state as? PdfState.Loaded ?: return
+        state = loaded.copy(selection = selection)
     }
 
     override fun onCleared() {

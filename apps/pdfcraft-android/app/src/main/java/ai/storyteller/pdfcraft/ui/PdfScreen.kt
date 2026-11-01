@@ -8,7 +8,10 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -18,7 +21,10 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -37,19 +43,32 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color as ComposeColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import java.nio.ByteBuffer
+import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.pdfcraft_mobile_ffi.OutlineEntry
+import uniffi.pdfcraft_mobile_ffi.TextSelection
 import uniffi.pdfcraft_mobile_ffi.buildInfo
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -104,12 +123,17 @@ fun PdfScreen(viewModel: PdfViewModel, onPickDocument: () -> Unit) {
                         Button(onClick = onPickDocument) { Text("Try another file") }
                     }
                 is PdfState.Loaded ->
-                    PageView(
-                        state = state,
-                        onPrev = { viewModel.goToPage(state.page - 1) },
-                        onNext = { viewModel.goToPage(state.page + 1) },
-                        onGoToPage = { viewModel.goToPage(it) },
-                    )
+                    Column(modifier = Modifier.fillMaxSize()) {
+                        PageView(
+                            state = state,
+                            onPrev = { viewModel.goToPage(state.page - 1) },
+                            onNext = { viewModel.goToPage(state.page + 1) },
+                            onGoToPage = { viewModel.goToPage(it) },
+                            onSelectionChange = viewModel::setSelection,
+                            modifier = Modifier.weight(1f),
+                        )
+                        state.selection?.let { selection -> CopyBar(text = selection.text, onCopied = { viewModel.setSelection(null) }) }
+                    }
             }
         }
     }
@@ -149,6 +173,23 @@ private fun FindBar(
     }
 }
 
+/** Shown while a text selection is active; copies it to the system clipboard. */
+@Composable
+private fun CopyBar(text: String, onCopied: () -> Unit) {
+    val clipboard = LocalClipboardManager.current
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(text, modifier = Modifier.weight(1f), maxLines = 1)
+        Button(onClick = {
+            clipboard.setText(AnnotatedString(text))
+            onCopied()
+        }) { Text("Copy") }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun OutlineSheet(entries: List<OutlineEntry>, onSelect: (Int) -> Unit, onDismiss: () -> Unit) {
@@ -167,13 +208,32 @@ private fun OutlineSheet(entries: List<OutlineEntry>, onSelect: (Int) -> Unit, o
     }
 }
 
-/** Renders the current page off the main thread and shows it, with pinch-to-zoom, a jump bar and
- * the active search match (if any) baked into the bitmap so it pans/zooms with the page. */
+/**
+ * Renders the current page off the main thread and shows it, with pinch-to-zoom, a jump bar,
+ * word-selection (long-press, drag either handle, Copy) and the active search match (if any)
+ * baked into the bitmap so it pans/zooms with the page for free.
+ *
+ * The bitmap is displayed at its exact pixel size, scaled by one explicit transform this
+ * composable computes itself (`baseScale`, fitting the bitmap to the available box, composed
+ * with the pinch `zoom`/`pan`) rather than `Image`'s own content-scaling layered under a second,
+ * independent `graphicsLayer` scale. Selection needs to invert a screen point back to the exact
+ * bitmap pixel `nearest(x, y)` expects; two partly-implicit scale factors can't be inverted
+ * precisely, one explicit one can (`toBitmapPoint`/`toScreenPoint`).
+ */
 @Composable
-private fun PageView(state: PdfState.Loaded, onPrev: () -> Unit, onNext: () -> Unit, onGoToPage: (Int) -> Unit) {
+private fun PageView(
+    state: PdfState.Loaded,
+    onPrev: () -> Unit,
+    onNext: () -> Unit,
+    onGoToPage: (Int) -> Unit,
+    onSelectionChange: (TextSelection?) -> Unit,
+    modifier: Modifier = Modifier,
+) {
     var bitmap by remember(state.document, state.page, state.activeMatch) { mutableStateOf<Bitmap?>(null) }
     var zoom by remember(state.page) { mutableFloatStateOf(1f) }
     var pan by remember(state.page) { mutableStateOf(Offset.Zero) }
+    var boxSize by remember { mutableStateOf(IntSize.Zero) }
+    val coroutineScope = rememberCoroutineScope()
 
     LaunchedEffect(state.document, state.page, state.activeMatch) {
         val rendered = withContext(Dispatchers.Default) { state.document.renderPage(state.page.toUInt(), RENDER_SCALE) }
@@ -188,30 +248,83 @@ private fun PageView(state: PdfState.Loaded, onPrev: () -> Unit, onNext: () -> U
         bitmap = decoded
     }
 
-    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxSize()) {
+    val bmp = bitmap
+    val baseScale =
+        if (bmp != null && boxSize.width > 0 && boxSize.height > 0) {
+            min(boxSize.width.toFloat() / bmp.width, boxSize.height.toFloat() / bmp.height)
+        } else {
+            1f
+        }
+    val totalScale = baseScale * zoom
+    val baseOffsetX = if (bmp != null) (boxSize.width - bmp.width * baseScale) / 2f else 0f
+    val baseOffsetY = if (bmp != null) (boxSize.height - bmp.height * baseScale) / 2f else 0f
+    val offsetX = baseOffsetX + pan.x
+    val offsetY = baseOffsetY + pan.y
+    fun toBitmapPoint(screen: Offset) = Offset((screen.x - offsetX) / totalScale, (screen.y - offsetY) / totalScale)
+    fun toScreenPoint(bitmapPt: Offset) = Offset(offsetX + bitmapPt.x * totalScale, offsetY + bitmapPt.y * totalScale)
+
+    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = modifier.fillMaxSize()) {
         Box(
             modifier =
-                Modifier.weight(1f).fillMaxWidth().pointerInput(state.page) {
-                    detectTransformGestures { _, panDelta, zoomDelta, _ ->
-                        zoom = (zoom * zoomDelta).coerceIn(1f, 5f)
-                        pan += panDelta
+                Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .onSizeChanged { boxSize = it }
+                    .pointerInput(state.page) {
+                        detectTransformGestures { _, panDelta, zoomDelta, _ ->
+                            zoom = (zoom * zoomDelta).coerceIn(1f, 5f)
+                            pan += panDelta
+                        }
                     }
-                },
+                    .pointerInput(state.page, bmp) {
+                        detectTapGestures(
+                            onLongPress = { screen ->
+                                if (bmp == null) return@detectTapGestures
+                                val pt = toBitmapPoint(screen)
+                                // Off the main thread: this page's text may not be cached yet
+                                // (text_cache, crates/mobile-ffi/src/lib.rs), so this specific
+                                // call — unlike extendSelection below, which only ever runs once
+                                // a selection (and so a warm cache) already exists — can be slow.
+                                coroutineScope.launch(Dispatchers.Default) {
+                                    val found = state.document.wordAt(state.page.toUInt(), pt.x, pt.y, RENDER_SCALE)
+                                    onSelectionChange(found)
+                                }
+                            },
+                            onTap = { if (state.selection != null) onSelectionChange(null) },
+                        )
+                    },
             contentAlignment = Alignment.Center,
         ) {
-            bitmap?.let {
+            val density = LocalDensity.current
+            bmp?.let {
                 Image(
                     bitmap = it.asImageBitmap(),
                     contentDescription = "Page ${state.page + 1}",
                     modifier =
-                        Modifier.graphicsLayer(
-                            scaleX = zoom,
-                            scaleY = zoom,
-                            translationX = pan.x,
-                            translationY = pan.y,
-                        ),
+                        Modifier
+                            .size(with(density) { it.width.toDp() }, with(density) { it.height.toDp() })
+                            .graphicsLayer {
+                                scaleX = totalScale
+                                scaleY = totalScale
+                                translationX = offsetX
+                                translationY = offsetY
+                                transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0f, 0f)
+                            },
                 )
             } ?: CircularProgressIndicator()
+
+            state.selection?.let { selection ->
+                SelectionOverlay(
+                    selection = selection,
+                    totalScale = totalScale,
+                    toScreenPoint = ::toScreenPoint,
+                    onDragHandle = { anchorGlyph, bitmapPoint ->
+                        onSelectionChange(
+                            state.document.extendSelection(state.page.toUInt(), anchorGlyph, bitmapPoint.x, bitmapPoint.y, RENDER_SCALE),
+                        )
+                    },
+                )
+            }
         }
         Row(
             modifier = Modifier.padding(16.dp),
@@ -232,4 +345,79 @@ private fun PageView(state: PdfState.Loaded, onPrev: () -> Unit, onNext: () -> U
             )
         }
     }
+}
+
+/** The selection's highlight (a [Canvas], transformed by hand since it isn't baked into the
+ * bitmap — re-rendering the whole page on every drag frame would defeat `text_cache` on the Rust
+ * side) and its two draggable handles. */
+@Composable
+private fun SelectionOverlay(
+    selection: TextSelection,
+    totalScale: Float,
+    toScreenPoint: (Offset) -> Offset,
+    onDragHandle: (anchorGlyph: UInt, bitmapPoint: Offset) -> Unit,
+) {
+    androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+        selection.rects.forEach { rect ->
+            val topLeft = toScreenPoint(Offset(rect.x0, rect.y0))
+            val bottomRight = toScreenPoint(Offset(rect.x1, rect.y1))
+            drawRect(
+                color = ComposeColor(0xFFFFD500).copy(alpha = 0.3f),
+                topLeft = topLeft,
+                size = Size(bottomRight.x - topLeft.x, bottomRight.y - topLeft.y),
+            )
+        }
+    }
+    val first = selection.rects.firstOrNull()
+    val last = selection.rects.lastOrNull()
+    if (first != null) {
+        SelectionHandle(
+            screenPoint = toScreenPoint(Offset(first.x0, first.y1)),
+            totalScale = totalScale,
+            cornerBitmapPoint = Offset(first.x0, first.y1),
+            onDragTo = { bitmapPoint -> onDragHandle(selection.endGlyph, bitmapPoint) },
+        )
+    }
+    if (last != null) {
+        SelectionHandle(
+            screenPoint = toScreenPoint(Offset(last.x1, last.y1)),
+            totalScale = totalScale,
+            cornerBitmapPoint = Offset(last.x1, last.y1),
+            onDragTo = { bitmapPoint -> onDragHandle(selection.startGlyph, bitmapPoint) },
+        )
+    }
+}
+
+/**
+ * A small draggable circle at one end of a selection. Its displayed position always comes from
+ * the live `selection` (via `screenPoint`), so it tracks a selection extended by dragging the
+ * *other* handle for free; its own drag accumulates in bitmap space from `cornerBitmapPoint`
+ * (read fresh at drag start via `rememberUpdatedState`, since `pointerInput`'s gesture coroutine
+ * — keyed only on `totalScale` — would otherwise keep whatever `cornerBitmapPoint` was in scope
+ * when that coroutine last (re)started, not the latest one).
+ */
+@Composable
+private fun SelectionHandle(screenPoint: Offset, totalScale: Float, cornerBitmapPoint: Offset, onDragTo: (Offset) -> Unit) {
+    val density = LocalDensity.current
+    val handleSizeDp = 28.dp
+    val handleSizePx = with(density) { handleSizeDp.toPx() }
+    val latestCorner by rememberUpdatedState(cornerBitmapPoint)
+    var dragPoint by remember { mutableStateOf(Offset.Zero) }
+    Box(
+        modifier =
+            Modifier
+                .offset { IntOffset((screenPoint.x - handleSizePx / 2).roundToInt(), (screenPoint.y - handleSizePx / 2).roundToInt()) }
+                .size(handleSizeDp)
+                .background(ComposeColor(0xFF2962FF), CircleShape)
+                .pointerInput(totalScale) {
+                    detectDragGestures(
+                        onDragStart = { dragPoint = latestCorner },
+                        onDrag = { change, dragAmount ->
+                            change.consume()
+                            dragPoint += Offset(dragAmount.x / totalScale, dragAmount.y / totalScale)
+                            onDragTo(dragPoint)
+                        },
+                    )
+                },
+    )
 }
