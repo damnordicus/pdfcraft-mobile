@@ -275,18 +275,20 @@ private fun PageView(
     fun toScreenPoint(bitmapPt: Offset) = Offset(offsetX + bitmapPt.x * totalScale, offsetY + bitmapPt.y * totalScale)
     // The long-press pointerInput below is keyed on (state.page, bmp), not on zoom/pan/boxSize,
     // so its gesture-detector coroutine survives a pinch-zoom without restarting; reading
-    // toBitmapPoint (or zoom/baseScale/totalScale/offsetX/offsetY) directly in its closure would
-    // keep whatever was current when that coroutine last started, not the latest — same
-    // staleness SelectionHandle's cornerBitmapPoint already works around below, here for the
-    // same reason. Bundled with the debug snapshot so both are the exact same fresh read.
-    fun hitTest(screen: Offset): Pair<Offset, String> {
-        val pt = toBitmapPoint(screen)
-        val debug =
-            "zoom=%.2f base=%.3f total=%.3f box=%dx%d bmp=%dx%d off=(%.0f,%.0f) screen=(%.0f,%.0f) pt=(%.0f,%.0f)"
-                .format(zoom, baseScale, totalScale, boxSize.width, boxSize.height, bmp?.width ?: 0, bmp?.height ?: 0, offsetX, offsetY, screen.x, screen.y, pt.x, pt.y)
-        return pt to debug
-    }
-    val latestHitTest by rememberUpdatedState(::hitTest)
+    // offsetX/offsetY/totalScale/bmp directly in its closure would keep whatever was current when
+    // that coroutine last started, not the latest. rememberUpdatedState on a local *function*
+    // reference (val x by rememberUpdatedState(::someLocalFun)) turned out not to update in
+    // practice (on-device: every long-press kept reading the pre-layout defaults, base=1.0,
+    // off=(0,0), bmp=0x0, regardless of the real, already-loaded state) — wrapping each plain
+    // value individually instead, which is the unambiguous, most common use of
+    // rememberUpdatedState, to rule out any doubt about why.
+    val liveOffsetX by rememberUpdatedState(offsetX)
+    val liveOffsetY by rememberUpdatedState(offsetY)
+    val liveTotalScale by rememberUpdatedState(totalScale)
+    val liveBaseScale by rememberUpdatedState(baseScale)
+    val liveZoom by rememberUpdatedState(zoom)
+    val liveBoxSize by rememberUpdatedState(boxSize)
+    val liveBmp by rememberUpdatedState(bmp)
 
     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = modifier.fillMaxSize()) {
         Box(
@@ -304,9 +306,15 @@ private fun PageView(
                     .pointerInput(state.page, bmp) {
                         detectTapGestures(
                             onLongPress = { screen ->
-                                if (bmp == null) return@detectTapGestures
-                                val (pt, debug) = latestHitTest(screen)
-                                debugText = debug
+                                val currentBmp = liveBmp ?: return@detectTapGestures
+                                val (ox, oy, ts) = Triple(liveOffsetX, liveOffsetY, liveTotalScale)
+                                val pt = Offset((screen.x - ox) / ts, (screen.y - oy) / ts)
+                                debugText =
+                                    "zoom=%.2f base=%.3f total=%.3f box=%dx%d bmp=%dx%d off=(%.0f,%.0f) screen=(%.0f,%.0f) pt=(%.0f,%.0f)"
+                                        .format(
+                                            liveZoom, liveBaseScale, ts, liveBoxSize.width, liveBoxSize.height,
+                                            currentBmp.width, currentBmp.height, ox, oy, screen.x, screen.y, pt.x, pt.y,
+                                        )
                                 // Off the main thread: this page's text may not be cached yet
                                 // (text_cache, crates/mobile-ffi/src/lib.rs), so this specific
                                 // call — unlike extendSelection below, which only ever runs once
