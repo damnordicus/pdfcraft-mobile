@@ -262,6 +262,12 @@ private fun PageView(
     val offsetY = baseOffsetY + pan.y
     fun toBitmapPoint(screen: Offset) = Offset((screen.x - offsetX) / totalScale, (screen.y - offsetY) / totalScale)
     fun toScreenPoint(bitmapPt: Offset) = Offset(offsetX + bitmapPt.x * totalScale, offsetY + bitmapPt.y * totalScale)
+    // The long-press pointerInput below is keyed on (state.page, bmp), not on zoom/pan/boxSize,
+    // so its gesture-detector coroutine survives a pinch-zoom without restarting; reading
+    // toBitmapPoint directly in its closure would keep whatever offsetX/offsetY/totalScale was
+    // current when that coroutine last started, not the latest one — same staleness
+    // SelectionHandle's cornerBitmapPoint already works around below, here for the same reason.
+    val latestToBitmapPoint by rememberUpdatedState(::toBitmapPoint)
 
     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = modifier.fillMaxSize()) {
         Box(
@@ -280,7 +286,7 @@ private fun PageView(
                         detectTapGestures(
                             onLongPress = { screen ->
                                 if (bmp == null) return@detectTapGestures
-                                val pt = toBitmapPoint(screen)
+                                val pt = latestToBitmapPoint(screen)
                                 // Off the main thread: this page's text may not be cached yet
                                 // (text_cache, crates/mobile-ffi/src/lib.rs), so this specific
                                 // call — unlike extendSelection below, which only ever runs once
