@@ -297,6 +297,13 @@ private fun PageView(
     // of "wrong word" comes with numbers instead of a screenshot to reverse-engineer. Remove once
     // selection's coordinate mapping is confirmed right on-device.
     var debugText by remember(state.page) { mutableStateOf("") }
+    // Temporary, alongside debugText: the exact bitmap point the long-press computed, drawn back
+    // onto the page as a crosshair. Numbers alone couldn't settle whether a wrong-word report
+    // meant the touch-to-bitmap transform is still off (the dot would be off the fingertip too)
+    // or that transform is fine and `word_at`/`nearest` (crates/render/src/text.rs) is picking the
+    // wrong glyph from a correct point (the dot would land right on the fingertip, on the wrong
+    // word). Remove alongside debugText.
+    var lastTouchPoint by remember(state.page) { mutableStateOf<Offset?>(null) }
 
     LaunchedEffect(state.document, state.page, state.activeMatch) {
         val rendered = withContext(Dispatchers.Default) { state.document.renderPage(state.page.toUInt(), RENDER_SCALE) }
@@ -361,6 +368,7 @@ private fun PageView(
                                 val currentBmp = liveBmp ?: return@detectTapGestures
                                 val (ox, oy, ts) = Triple(liveOffsetX, liveOffsetY, liveTotalScale)
                                 val pt = Offset((screen.x - ox) / ts, (screen.y - oy) / ts)
+                                lastTouchPoint = pt
                                 // A local val, not shared mutable state: two long-presses in
                                 // quick succession (before the first's background wordAt
                                 // returns) must not let the first's late result clobber onto the
@@ -385,7 +393,12 @@ private fun PageView(
                                     onSelectionChange(found)
                                 }
                             },
-                            onTap = { if (state.selection != null) onSelectionChange(null) },
+                            onTap = {
+                                if (state.selection != null) {
+                                    lastTouchPoint = null
+                                    onSelectionChange(null)
+                                }
+                            },
                         )
                     },
             // TopStart, not the default Center: every absolutely-positioned child below (the
@@ -425,6 +438,13 @@ private fun PageView(
                         )
                     },
                 )
+            }
+            lastTouchPoint?.let { touch ->
+                val crosshair = toScreenPoint(touch)
+                androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+                    drawLine(ComposeColor.Red, Offset(crosshair.x - 24f, crosshair.y), Offset(crosshair.x + 24f, crosshair.y), strokeWidth = 4f)
+                    drawLine(ComposeColor.Red, Offset(crosshair.x, crosshair.y - 24f), Offset(crosshair.x, crosshair.y + 24f), strokeWidth = 4f)
+                }
             }
         }
         if (debugText.isNotEmpty()) {
