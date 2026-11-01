@@ -1,0 +1,289 @@
+//! FFI boundary for native mobile apps (iOS, Android): a thin UniFFI wrapper around
+//! `pdfcraft-render`'s read path (architecture §4, L7 frontends; this crate is `Class::Exempt` in
+//! `xtask/src/layers.rs`, the same bucket as the other app entry points).
+//!
+//! This crate is a reader: open a document, read its page count/title/outline, render pages on
+//! demand, search for text across the document, and select/copy text on one page. Editing goes
+//! through `pdfcraft-engine` and is out of scope here until a later milestone extends this
+//! crate's surface.
+
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use pdfcraft_render::{OpenError, OutlineItem, PageRenderer, PageText, RenderConfig, RenderRequest, RequestKind, inspect};
+
+uniffi::setup_scaffolding!();
+
+/// The git commit this build came from (`build.rs`), so a running app can show which source
+/// it's actually running — useful for confirming a rebuild really picked up a change, not just
+/// that some build succeeded.
+#[uniffi::export]
+pub fn build_info() -> String {
+    env!("PDFCRAFT_MOBILE_FFI_COMMIT").to_owned()
+}
+
+/// Why a document could not be opened or a page could not be rendered.
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum MobileError {
+    #[error("the file is not a readable PDF")]
+    Invalid,
+    #[error("the document is protected by a password")]
+    NeedsPassword,
+    #[error("the password is incorrect")]
+    WrongPassword,
+    #[error("this document isn't supported yet: {reason}")]
+    Unsupported { reason: String },
+    #[error("there is no page {index}")]
+    NoSuchPage { index: u32 },
+    #[error("page {index} could not be rendered: {reason}")]
+    RenderFailed { index: u32, reason: String },
+}
+
+impl From<OpenError> for MobileError {
+    fn from(err: OpenError) -> Self {
+        match err {
+            OpenError::Invalid(_) => Self::Invalid,
+            OpenError::NeedsPassword => Self::NeedsPassword,
+            OpenError::WrongPassword => Self::WrongPassword,
+            OpenError::Unsupported(reason) => Self::Unsupported { reason },
+        }
+    }
+}
+
+/// A single rasterized page, ready for a native `UIImage` (iOS) or `Bitmap` (Android).
+#[derive(uniffi::Record)]
+pub struct MobilePage {
+    pub width: u32,
+    pub height: u32,
+    /// Premultiplied RGBA8, row-major, 4 bytes per pixel.
+    pub rgba: Vec<u8>,
+}
+
+/// One flattened table-of-contents entry (`DocInfo::outline`, depth-first).
+#[derive(Clone, uniffi::Record)]
+pub struct OutlineEntry {
+    pub title: String,
+    pub page: u32,
+    pub depth: u32,
+}
+
+/// A rectangle in the same page-view-space pixel coordinates a [`MobilePage`] rendered at the
+/// same `scale` uses, so it can be drawn directly over that bitmap.
+#[derive(Clone, Copy, Debug, uniffi::Record)]
+pub struct Rect {
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+}
+
+/// One match from [`MobileDocument::search`].
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct SearchMatch {
+    pub page: u32,
+    /// A line of context around the match, not just the matched characters.
+    pub snippet: String,
+    /// One rect per visual line the match touches (a match can wrap a line).
+    pub rects: Vec<Rect>,
+}
+
+/// A text selection on one page, from [`MobileDocument::word_at`] or
+/// [`MobileDocument::extend_selection`]: its glyph range (an opaque handle back into the page's
+/// text, meaningful only as the `anchor_glyph` of a later `extend_selection` call on the same
+/// page), its highlight rects, and its text, ready for the system clipboard.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct TextSelection {
+    pub start_glyph: u32,
+    pub end_glyph: u32,
+    /// One rect per visual line the selection touches.
+    pub rects: Vec<Rect>,
+    pub text: String,
+}
+
+/// A document opened for reading: validated once at [`MobileDocument::open`], then rendered on
+/// demand through [`MobileDocument::render_page`].
+#[derive(uniffi::Object)]
+pub struct MobileDocument {
+    page_count: usize,
+    title: Option<String>,
+    outline: Vec<OutlineEntry>,
+    renderer: Mutex<PageRenderer>,
+    /// The last page's extracted text, reused by repeated `word_at`/`extend_selection` calls on
+    /// the same page (a selection drag fires far more often than a search) instead of
+    /// re-extracting on every call.
+    text_cache: Mutex<Option<(usize, Arc<PageText>)>>,
+}
+
+#[uniffi::export]
+impl MobileDocument {
+    /// Opens `bytes` for reading. Pass `password` when the document needs one;
+    /// `MobileError::NeedsPassword` or `MobileError::WrongPassword` means try again with one.
+    #[uniffi::constructor]
+    pub fn open(bytes: Vec<u8>, password: Option<String>) -> Result<Arc<Self>, MobileError> {
+        let bytes = Arc::new(bytes);
+        let info = inspect(bytes.clone(), password.as_deref())?;
+        let config = RenderConfig { password: password.map(|p| Arc::from(p.as_str())), ..Default::default() };
+        Ok(Arc::new(Self {
+            page_count: info.pages.len(),
+            title: info.title,
+            outline: flatten_outline(&info.outline, 0),
+            renderer: Mutex::new(PageRenderer::new(bytes, config)),
+            text_cache: Mutex::new(None),
+        }))
+    }
+
+    pub fn page_count(&self) -> u32 {
+        u32::try_from(self.page_count).unwrap_or(u32::MAX)
+    }
+
+    pub fn title(&self) -> Option<String> {
+        self.title.clone()
+    }
+
+    pub fn outline(&self) -> Vec<OutlineEntry> {
+        self.outline.clone()
+    }
+
+    /// Renders `page` (0-based) at `scale` device pixels per PDF point — the screen's device
+    /// scale factor times the desired zoom level.
+    pub fn render_page(&self, page: u32, scale: f32) -> Result<MobilePage, MobileError> {
+        if page as usize >= self.page_count {
+            return Err(MobileError::NoSuchPage { index: page });
+        }
+        let mut renderer = lock_or_recover(&self.renderer);
+        let shot = renderer.render(RenderRequest { page: page as usize, scale, ..Default::default() });
+        if let Some(reason) = shot.error {
+            return Err(MobileError::RenderFailed { index: page, reason });
+        }
+        Ok(MobilePage { width: shot.width, height: shot.height, rgba: shot.rgba.to_vec() })
+    }
+
+    /// Searches every page for `query` at `scale` (the same scale the caller renders pages at,
+    /// so each match's `rects` line up with that page's bitmap). A page whose text can't be
+    /// extracted is skipped, not an error for the whole search.
+    ///
+    /// Extracts text for every page in one call, so cost scales with document length; there is
+    /// no incremental/streaming search yet (unlike the desktop app's find bar).
+    pub fn search(&self, query: String, case_sensitive: bool, whole_words: bool, scale: f32) -> Vec<SearchMatch> {
+        let mut renderer = lock_or_recover(&self.renderer);
+        let mut matches = Vec::new();
+        for page in 0..self.page_count {
+            let shot = renderer.render(RenderRequest { page, kind: RequestKind::Text, scale, ..Default::default() });
+            let Some(text) = shot.text else { continue };
+            let Ok(page) = u32::try_from(page) else { continue };
+            for range in text.find_opts(&query, case_sensitive, whole_words) {
+                matches.push(SearchMatch {
+                    page,
+                    snippet: text.text_of(line_range(&text, &range)),
+                    rects: scaled_rects(text.line_rects(range), scale),
+                });
+            }
+        }
+        matches
+    }
+
+    /// The word at (`x`, `y`) on `page` (device pixels at `scale`), for starting a selection with
+    /// a long-press. `None` only when the page has no text at all; a point not exactly on a
+    /// glyph still finds the nearest one (`PageText::nearest`'s own behaviour).
+    pub fn word_at(&self, page: u32, x: f32, y: f32, scale: f32) -> Option<TextSelection> {
+        let text = self.text_for(page as usize)?;
+        let i = text.nearest(x / scale, y / scale)?;
+        let (start, end) = text.word_at(i)?;
+        Some(selection_of(&text, start, end, scale))
+    }
+
+    /// Extends or moves a selection while a handle is dragged: the end at `anchor_glyph` stays
+    /// put, the other end moves to the glyph nearest (`x`, `y`) (device pixels at `scale`). Call
+    /// with whichever handle *isn't* being dragged as `anchor_glyph`, so either handle works the
+    /// same way. `anchor_glyph` is a `start_glyph`/`end_glyph` from an earlier `TextSelection` on
+    /// this same page; passing one from a different page is meaningless.
+    pub fn extend_selection(&self, page: u32, anchor_glyph: u32, x: f32, y: f32, scale: f32) -> Option<TextSelection> {
+        let text = self.text_for(page as usize)?;
+        let moving = text.nearest(x / scale, y / scale)?;
+        let anchor = anchor_glyph as usize;
+        let (start, end) = if moving >= anchor { (anchor, moving) } else { (moving, anchor) };
+        Some(selection_of(&text, start, end, scale))
+    }
+}
+
+// Not `#[uniffi::export]`: not part of the FFI surface, and `usize`/`Arc<PageText>` aren't FFI
+// types uniffi knows how to convert.
+impl MobileDocument {
+    fn text_for(&self, page: usize) -> Option<Arc<PageText>> {
+        {
+            let cache = lock_or_recover(&self.text_cache);
+            if let Some((cached_page, text)) = cache.as_ref()
+                && *cached_page == page
+            {
+                return Some(text.clone());
+            }
+        }
+        let text = {
+            let mut renderer = lock_or_recover(&self.renderer);
+            renderer.render(RenderRequest { page, kind: RequestKind::Text, ..Default::default() }).text?
+        };
+        *lock_or_recover(&self.text_cache) = Some((page, text.clone()));
+        Some(text)
+    }
+}
+
+/// Recovers the guard from a poisoned mutex instead of panicking (CLAUDE.md §Never panic): a
+/// render call that failed midway leaves no invariant for `PageRenderer` itself to violate.
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Widens `range` to the full line(s) its first and last glyph belong to, for a snippet with a
+/// line of context rather than just the bare matched characters. Falls back to `range` itself
+/// when a line's glyphs can't be found (defensive only; `find_opts` always returns valid ranges).
+fn line_range(text: &PageText, range: &std::ops::Range<usize>) -> std::ops::Range<usize> {
+    let first_line = text.line_of.get(range.start).copied();
+    let last_line = range.end.checked_sub(1).and_then(|i| text.line_of.get(i)).copied();
+    let start = first_line.and_then(|line| text.line_of.iter().position(|&l| l == line));
+    let end = last_line.and_then(|line| text.line_of.iter().rposition(|&l| l == line));
+    match (start, end) {
+        (Some(start), Some(end)) => start..(end + 1),
+        _ => range.clone(),
+    }
+}
+
+/// Converts `PageText`'s own rects (PDF points) into device pixels at `scale`.
+///
+/// `TextGlyph::rect` (what `PageText::line_rects`/`glyph_rects` are built from) is in PDF points,
+/// unaffected by the `RenderRequest::scale` passed in to get `text` (`render_page`'s
+/// `RequestKind::Text` branch never reads `scale` — `crates/render/src/raster.rs`'s
+/// `render_page`) — unlike a rasterized page, whose pixel dimensions **are** `scale`
+/// device-pixels-per-point. This is that conversion, so a highlight lines up with a page bitmap
+/// rendered at the same `scale`.
+fn scaled_rects(rects: Vec<[f32; 4]>, scale: f32) -> Vec<Rect> {
+    rects.into_iter().map(|[x0, y0, x1, y1]| Rect { x0: x0 * scale, y0: y0 * scale, x1: x1 * scale, y1: y1 * scale }).collect()
+}
+
+/// Builds a [`TextSelection`] for the glyph range `start..=end`.
+fn selection_of(text: &PageText, start: usize, end: usize, scale: f32) -> TextSelection {
+    let range = start..end.saturating_add(1);
+    TextSelection {
+        start_glyph: u32::try_from(start).unwrap_or(u32::MAX),
+        end_glyph: u32::try_from(end).unwrap_or(u32::MAX),
+        rects: scaled_rects(text.line_rects(range.clone()), scale),
+        text: text.text_of(range),
+    }
+}
+
+fn flatten_outline(items: &[OutlineItem], depth: u32) -> Vec<OutlineEntry> {
+    let mut out = Vec::new();
+    for item in items {
+        if let Some(page) = item.page.and_then(|p| u32::try_from(p).ok()) {
+            out.push(OutlineEntry { title: item.title.clone(), page, depth });
+        }
+        out.extend(flatten_outline(&item.children, depth + 1));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests;

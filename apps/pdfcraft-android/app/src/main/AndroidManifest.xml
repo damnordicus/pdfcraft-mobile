@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:allowBackup="true"
+        android:icon="@android:drawable/ic_menu_gallery"
+        android:label="@string/app_name"
+        android:supportsRtl="true">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Lets a file manager or share sheet offer "open with PdfCraft" for a local PDF.
+                 Not android.intent.category.BROWSABLE: that's for web links, not local files.
+                 Matching by mimeType alone (no scheme/host) is the standard pattern for a file
+                 type handler; lint's AppLinkUrlError treats it as a deep-link candidate anyway
+                 and wants App Links data this isn't, so it's accepted in lint-baseline.xml. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/pdf" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>
