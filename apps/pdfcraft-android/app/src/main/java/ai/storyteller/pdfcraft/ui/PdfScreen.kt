@@ -293,7 +293,13 @@ private fun PageView(
                             onTap = { if (state.selection != null) onSelectionChange(null) },
                         )
                     },
-            contentAlignment = Alignment.Center,
+            // TopStart, not the default Center: every absolutely-positioned child below (the
+            // Image's graphicsLayer, each SelectionHandle's Modifier.offset) assumes it's placed
+            // at (0, 0) before that positioning is applied, via toScreenPoint/toBitmapPoint's
+            // offsetX/offsetY math. Center would place each child (at its own *measured* size —
+            // for Image, the bitmap's full native size, before any scaling) in the middle of the
+            // box first, silently adding an extra, uncomputed shift on top of the real one.
+            contentAlignment = Alignment.TopStart,
         ) {
             val density = LocalDensity.current
             bmp?.let {
@@ -311,7 +317,7 @@ private fun PageView(
                                 transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0f, 0f)
                             },
                 )
-            } ?: CircularProgressIndicator()
+            } ?: CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
 
             state.selection?.let { selection ->
                 SelectionOverlay(
