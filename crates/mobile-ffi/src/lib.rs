@@ -146,7 +146,7 @@ impl MobileDocument {
             let Some(text) = shot.text else { continue };
             let Ok(page) = u32::try_from(page) else { continue };
             for range in text.find_opts(&query, case_sensitive, whole_words) {
-                matches.push(SearchMatch { page, snippet: text.text_of(line_range(&text, &range)), rects: match_rects(&text, &range) });
+                matches.push(SearchMatch { page, snippet: text.text_of(line_range(&text, &range)), rects: match_rects(&text, &range, scale) });
             }
         }
         matches
@@ -178,11 +178,17 @@ fn line_range(text: &PageText, range: &std::ops::Range<usize>) -> std::ops::Rang
 
 /// One bounding rect per visual line `range`'s glyphs touch (a match can wrap a line); glyphs of
 /// the same line are contiguous in `text.glyphs`, so adjacent same-line glyphs merge in place.
-fn match_rects(text: &PageText, range: &std::ops::Range<usize>) -> Vec<Rect> {
+///
+/// `TextGlyph::rect` is in PDF points, unaffected by the `RenderRequest::scale` passed in to get
+/// `text` (`render_page`'s `RequestKind::Text` branch never reads `scale` —
+/// `crates/render/src/raster.rs`'s `render_page`) — unlike a rasterized page, whose pixel
+/// dimensions **are** `scale` device-pixels-per-point. `scale` here converts the point rect into
+/// that same device-pixel space, so it lines up with a page bitmap rendered at the same `scale`.
+fn match_rects(text: &PageText, range: &std::ops::Range<usize>, scale: f32) -> Vec<Rect> {
     let mut rects: Vec<(u32, Rect)> = Vec::new();
     for i in range.clone() {
         let (Some(glyph), Some(&line)) = (text.glyphs.get(i), text.line_of.get(i)) else { continue };
-        let [x0, y0, x1, y1] = glyph.rect;
+        let [x0, y0, x1, y1] = glyph.rect.map(|c| c * scale);
         match rects.last_mut() {
             Some((last_line, rect)) if *last_line == line => {
                 rect.x0 = rect.x0.min(x0);

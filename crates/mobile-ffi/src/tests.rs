@@ -117,3 +117,27 @@ fn a_match_spanning_a_line_wrap_is_one_match_with_a_rect_per_line() {
     assert_eq!(matches.len(), 1, "expected one match spanning both lines, got {matches:?}");
     assert_eq!(matches[0].rects.len(), 2, "expected one rect per line, got {:?}", matches[0].rects);
 }
+
+/// `render_page`'s pixels scale with `scale`; `TextGlyph::rect` (and so a match's `rects`) does
+/// not unless `search` itself applies it — `RequestKind::Text` never reads `RenderRequest::scale`
+/// (`crates/render/src/raster.rs`). Regression for exactly that: at `scale` 1.0 the earlier,
+/// unscaled tests above happened to pass regardless, which is why this needs its own case at a
+/// scale that actually exposes it.
+#[test]
+fn search_rects_line_up_with_a_page_rendered_at_the_same_scale() {
+    let doc = MobileDocument::open(fixture(1), None).expect("opens");
+    let page = doc.render_page(0, 2.0).expect("renders");
+    let matches = doc.search("Page 1".to_owned(), false, false, 2.0);
+    assert_eq!(matches.len(), 1);
+    let rect = matches[0].rects[0];
+    assert!(rect.x1 <= page.width as f32 + 0.01, "{rect:?} doesn't fit page width {}", page.width);
+    assert!(rect.y1 <= page.height as f32 + 0.01, "{rect:?} doesn't fit page height {}", page.height);
+    // Not just "within bounds" by accident: before the fix the point-space rect, read as device
+    // pixels at 2x scale, was squeezed into a sliver near the origin instead of a real highlight.
+    assert!(rect.x1 - rect.x0 > 10.0, "{rect:?} is too small to be a real highlight");
+
+    let at_1x = doc.search("Page 1".to_owned(), false, false, 1.0);
+    let unscaled = at_1x[0].rects[0];
+    assert!((rect.x0 - unscaled.x0 * 2.0).abs() < 0.01, "{unscaled:?} doubled should be {rect:?}");
+    assert!((rect.y1 - unscaled.y1 * 2.0).abs() < 0.01, "{unscaled:?} doubled should be {rect:?}");
+}
