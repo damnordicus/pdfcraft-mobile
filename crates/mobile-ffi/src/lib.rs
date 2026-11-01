@@ -3,8 +3,9 @@
 //! `xtask/src/layers.rs`, the same bucket as the other app entry points).
 //!
 //! This crate is a reader: open a document, read its page count/title/outline, render pages on
-//! demand, and search for text across the document. Editing goes through `pdfcraft-engine` and
-//! is out of scope here until a later milestone extends this crate's surface.
+//! demand, search for text across the document, and select/copy text on one page. Editing goes
+//! through `pdfcraft-engine` and is out of scope here until a later milestone extends this
+//! crate's surface.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
@@ -87,6 +88,19 @@ pub struct SearchMatch {
     pub rects: Vec<Rect>,
 }
 
+/// A text selection on one page, from [`MobileDocument::word_at`] or
+/// [`MobileDocument::extend_selection`]: its glyph range (an opaque handle back into the page's
+/// text, meaningful only as the `anchor_glyph` of a later `extend_selection` call on the same
+/// page), its highlight rects, and its text, ready for the system clipboard.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct TextSelection {
+    pub start_glyph: u32,
+    pub end_glyph: u32,
+    /// One rect per visual line the selection touches.
+    pub rects: Vec<Rect>,
+    pub text: String,
+}
+
 /// A document opened for reading: validated once at [`MobileDocument::open`], then rendered on
 /// demand through [`MobileDocument::render_page`].
 #[derive(uniffi::Object)]
@@ -95,6 +109,10 @@ pub struct MobileDocument {
     title: Option<String>,
     outline: Vec<OutlineEntry>,
     renderer: Mutex<PageRenderer>,
+    /// The last page's extracted text, reused by repeated `word_at`/`extend_selection` calls on
+    /// the same page (a selection drag fires far more often than a search) instead of
+    /// re-extracting on every call.
+    text_cache: Mutex<Option<(usize, Arc<PageText>)>>,
 }
 
 #[uniffi::export]
@@ -111,6 +129,7 @@ impl MobileDocument {
             title: info.title,
             outline: flatten_outline(&info.outline, 0),
             renderer: Mutex::new(PageRenderer::new(bytes, config)),
+            text_cache: Mutex::new(None),
         }))
     }
 
@@ -154,10 +173,58 @@ impl MobileDocument {
             let Some(text) = shot.text else { continue };
             let Ok(page) = u32::try_from(page) else { continue };
             for range in text.find_opts(&query, case_sensitive, whole_words) {
-                matches.push(SearchMatch { page, snippet: text.text_of(line_range(&text, &range)), rects: match_rects(&text, &range, scale) });
+                matches.push(SearchMatch {
+                    page,
+                    snippet: text.text_of(line_range(&text, &range)),
+                    rects: scaled_rects(text.line_rects(range), scale),
+                });
             }
         }
         matches
+    }
+
+    /// The word at (`x`, `y`) on `page` (device pixels at `scale`), for starting a selection with
+    /// a long-press. `None` only when the page has no text at all; a point not exactly on a
+    /// glyph still finds the nearest one (`PageText::nearest`'s own behaviour).
+    pub fn word_at(&self, page: u32, x: f32, y: f32, scale: f32) -> Option<TextSelection> {
+        let text = self.text_for(page as usize)?;
+        let i = text.nearest(x / scale, y / scale)?;
+        let (start, end) = text.word_at(i)?;
+        Some(selection_of(&text, start, end, scale))
+    }
+
+    /// Extends or moves a selection while a handle is dragged: the end at `anchor_glyph` stays
+    /// put, the other end moves to the glyph nearest (`x`, `y`) (device pixels at `scale`). Call
+    /// with whichever handle *isn't* being dragged as `anchor_glyph`, so either handle works the
+    /// same way. `anchor_glyph` is a `start_glyph`/`end_glyph` from an earlier `TextSelection` on
+    /// this same page; passing one from a different page is meaningless.
+    pub fn extend_selection(&self, page: u32, anchor_glyph: u32, x: f32, y: f32, scale: f32) -> Option<TextSelection> {
+        let text = self.text_for(page as usize)?;
+        let moving = text.nearest(x / scale, y / scale)?;
+        let anchor = anchor_glyph as usize;
+        let (start, end) = if moving >= anchor { (anchor, moving) } else { (moving, anchor) };
+        Some(selection_of(&text, start, end, scale))
+    }
+}
+
+// Not `#[uniffi::export]`: not part of the FFI surface, and `usize`/`Arc<PageText>` aren't FFI
+// types uniffi knows how to convert.
+impl MobileDocument {
+    fn text_for(&self, page: usize) -> Option<Arc<PageText>> {
+        {
+            let cache = lock_or_recover(&self.text_cache);
+            if let Some((cached_page, text)) = cache.as_ref()
+                && *cached_page == page
+            {
+                return Some(text.clone());
+            }
+        }
+        let text = {
+            let mut renderer = lock_or_recover(&self.renderer);
+            renderer.render(RenderRequest { page, kind: RequestKind::Text, ..Default::default() }).text?
+        };
+        *lock_or_recover(&self.text_cache) = Some((page, text.clone()));
+        Some(text)
     }
 }
 
@@ -184,30 +251,27 @@ fn line_range(text: &PageText, range: &std::ops::Range<usize>) -> std::ops::Rang
     }
 }
 
-/// One bounding rect per visual line `range`'s glyphs touch (a match can wrap a line); glyphs of
-/// the same line are contiguous in `text.glyphs`, so adjacent same-line glyphs merge in place.
+/// Converts `PageText`'s own rects (PDF points) into device pixels at `scale`.
 ///
-/// `TextGlyph::rect` is in PDF points, unaffected by the `RenderRequest::scale` passed in to get
-/// `text` (`render_page`'s `RequestKind::Text` branch never reads `scale` —
-/// `crates/render/src/raster.rs`'s `render_page`) — unlike a rasterized page, whose pixel
-/// dimensions **are** `scale` device-pixels-per-point. `scale` here converts the point rect into
-/// that same device-pixel space, so it lines up with a page bitmap rendered at the same `scale`.
-fn match_rects(text: &PageText, range: &std::ops::Range<usize>, scale: f32) -> Vec<Rect> {
-    let mut rects: Vec<(u32, Rect)> = Vec::new();
-    for i in range.clone() {
-        let (Some(glyph), Some(&line)) = (text.glyphs.get(i), text.line_of.get(i)) else { continue };
-        let [x0, y0, x1, y1] = glyph.rect.map(|c| c * scale);
-        match rects.last_mut() {
-            Some((last_line, rect)) if *last_line == line => {
-                rect.x0 = rect.x0.min(x0);
-                rect.y0 = rect.y0.min(y0);
-                rect.x1 = rect.x1.max(x1);
-                rect.y1 = rect.y1.max(y1);
-            }
-            _ => rects.push((line, Rect { x0, y0, x1, y1 })),
-        }
+/// `TextGlyph::rect` (what `PageText::line_rects`/`glyph_rects` are built from) is in PDF points,
+/// unaffected by the `RenderRequest::scale` passed in to get `text` (`render_page`'s
+/// `RequestKind::Text` branch never reads `scale` — `crates/render/src/raster.rs`'s
+/// `render_page`) — unlike a rasterized page, whose pixel dimensions **are** `scale`
+/// device-pixels-per-point. This is that conversion, so a highlight lines up with a page bitmap
+/// rendered at the same `scale`.
+fn scaled_rects(rects: Vec<[f32; 4]>, scale: f32) -> Vec<Rect> {
+    rects.into_iter().map(|[x0, y0, x1, y1]| Rect { x0: x0 * scale, y0: y0 * scale, x1: x1 * scale, y1: y1 * scale }).collect()
+}
+
+/// Builds a [`TextSelection`] for the glyph range `start..=end`.
+fn selection_of(text: &PageText, start: usize, end: usize, scale: f32) -> TextSelection {
+    let range = start..end.saturating_add(1);
+    TextSelection {
+        start_glyph: u32::try_from(start).unwrap_or(u32::MAX),
+        end_glyph: u32::try_from(end).unwrap_or(u32::MAX),
+        rects: scaled_rects(text.line_rects(range.clone()), scale),
+        text: text.text_of(range),
     }
-    rects.into_iter().map(|(_, rect)| rect).collect()
 }
 
 fn flatten_outline(items: &[OutlineItem], depth: u32) -> Vec<OutlineEntry> {
