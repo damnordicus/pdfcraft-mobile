@@ -11,9 +11,13 @@ import android.graphics.Paint
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateCentroidSize
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -54,7 +58,9 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color as ComposeColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
@@ -64,6 +70,7 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import java.nio.ByteBuffer
+import kotlin.math.abs
 import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
@@ -216,6 +223,51 @@ private fun OutlineSheet(entries: List<OutlineEntry>, onSelect: (Int) -> Unit, o
 }
 
 /**
+ * Pan and pinch-zoom, requiring 2+ pointers for both — unlike `detectTransformGestures`, which
+ * also treats a single finger's movement as pan. That's the gesture-conflict bug a long-press
+ * selection hit in practice: `detectTransformGestures` and `detectTapGestures` are two
+ * independent detectors watching the same one-finger touch, and `detectTransformGestures` has no
+ * slop tolerance, so natural tremor during a long-press's ~500ms hold (ignored by the long-press
+ * timer) still accumulated into `pan` — sometimes *after* the long-press had already fired and
+ * computed its hit-test point, so the next recomposition's highlight render (always using the
+ * then-current pan) drifted from it. Single-finger touches are now exclusively tap/long-press/
+ * selection; panning while zoomed in is two-finger, same as the pinch that zoomed in to begin
+ * with. Adapted from `androidx.compose.foundation.gestures.detectTransformGestures`'s own
+ * implementation, with the `event.changes.size >= 2` gate added before `onGesture` fires.
+ */
+private suspend fun PointerInputScope.detectMultiTouchTransformGestures(onGesture: (pan: Offset, zoom: Float) -> Unit) {
+    awaitEachGesture {
+        var zoom = 1f
+        var pan = Offset.Zero
+        var pastSlop = false
+        val touchSlop = viewConfiguration.touchSlop
+
+        awaitFirstDown(requireUnconsumed = false)
+        do {
+            val event = awaitPointerEvent()
+            val canceled = event.changes.any { it.isConsumed }
+            if (!canceled) {
+                val zoomChange = event.calculateZoom()
+                val panChange = event.calculatePan()
+                if (!pastSlop) {
+                    zoom *= zoomChange
+                    pan += panChange
+                    val centroidSize = event.calculateCentroidSize(useCurrent = false)
+                    val zoomMotion = abs(1 - zoom) * centroidSize
+                    if (zoomMotion > touchSlop || pan.getDistance() > touchSlop) {
+                        pastSlop = true
+                    }
+                }
+                if (pastSlop && event.changes.size >= 2 && (zoomChange != 1f || panChange != Offset.Zero)) {
+                    onGesture(panChange, zoomChange)
+                }
+                event.changes.forEach { if (it.positionChanged()) it.consume() }
+            }
+        } while (!canceled && event.changes.any { it.pressed })
+    }
+}
+
+/**
  * Renders the current page off the main thread and shows it, with pinch-to-zoom, a jump bar,
  * word-selection (long-press, drag either handle, Copy) and the active search match (if any)
  * baked into the bitmap so it pans/zooms with the page for free.
@@ -298,7 +350,7 @@ private fun PageView(
                     .fillMaxWidth()
                     .onSizeChanged { boxSize = it }
                     .pointerInput(state.page) {
-                        detectTransformGestures { _, panDelta, zoomDelta, _ ->
+                        detectMultiTouchTransformGestures { panDelta, zoomDelta ->
                             zoom = (zoom * zoomDelta).coerceIn(1f, 5f)
                             pan += panDelta
                         }
