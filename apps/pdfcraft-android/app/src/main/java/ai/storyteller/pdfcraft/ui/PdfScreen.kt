@@ -1,5 +1,6 @@
 package ai.storyteller.pdfcraft.ui
 
+import ai.storyteller.pdfcraft.BuildConfig
 import ai.storyteller.pdfcraft.PdfState
 import ai.storyteller.pdfcraft.PdfViewModel
 import ai.storyteller.pdfcraft.RENDER_SCALE
@@ -110,7 +111,12 @@ fun PdfScreen(viewModel: PdfViewModel, onPickDocument: () -> Unit) {
         },
         // Debug aid so a rebuild is provably running the commit it's meant to, not a stale
         // native library or a stale installed APK — remove once mobile-ffi is past churning.
-        bottomBar = { Text("build ${buildInfo()}", modifier = Modifier.padding(4.dp)) },
+        // Two separate commits: ffi is crates/mobile-ffi's own build.rs, baked into the native
+        // library, and only changes when a Rust file does; app is this module's own build.gradle.kts
+        // (BuildConfig.GIT_COMMIT), the whole repo's commit at the time Gradle last configured —
+        // apart on purpose, so a Kotlin-only change that left ffi looking stale is still visible
+        // as a moved app tag, instead of looking like the whole rebuild didn't happen.
+        bottomBar = { Text("ffi ${buildInfo()} · app ${BuildConfig.GIT_COMMIT}", modifier = Modifier.padding(4.dp)) },
     ) { padding ->
         Box(modifier = Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
             when (state) {

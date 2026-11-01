@@ -1,8 +1,26 @@
+import java.io.ByteArrayOutputStream
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
 }
+
+/** `git rev-parse --short HEAD` at Gradle configuration time — this build's whole-repo commit,
+ * not just mobile-ffi's: `buildInfo()` (crates/mobile-ffi/build.rs) only changes when a Rust file
+ * changes, so a Kotlin-only commit leaves it stale even in a correctly rebuilt app. Both get shown
+ * in the app so either side's staleness is diagnosable on its own. */
+fun gitCommit(): String =
+    try {
+        val output = ByteArrayOutputStream()
+        exec {
+            commandLine("git", "rev-parse", "--short", "HEAD")
+            standardOutput = output
+        }
+        output.toString().trim()
+    } catch (e: Exception) {
+        "unknown"
+    }
 
 android {
     namespace = "ai.storyteller.pdfcraft"
@@ -16,10 +34,12 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
+        buildConfigField("String", "GIT_COMMIT", "\"${gitCommit()}\"")
     }
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     compileOptions {
