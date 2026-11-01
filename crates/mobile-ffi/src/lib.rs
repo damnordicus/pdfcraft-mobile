@@ -14,6 +14,14 @@ use pdfcraft_render::{OpenError, OutlineItem, PageRenderer, PageText, RenderConf
 
 uniffi::setup_scaffolding!();
 
+/// The git commit this build came from (`build.rs`), so a running app can show which source
+/// it's actually running — useful for confirming a rebuild really picked up a change, not just
+/// that some build succeeded.
+#[uniffi::export]
+pub fn build_info() -> String {
+    env!("PDFCRAFT_MOBILE_FFI_COMMIT").to_owned()
+}
+
 /// Why a document could not be opened or a page could not be rendered.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MobileError {

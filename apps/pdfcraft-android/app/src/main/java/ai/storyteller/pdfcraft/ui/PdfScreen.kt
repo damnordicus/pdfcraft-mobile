@@ -50,6 +50,7 @@ import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import uniffi.pdfcraft_mobile_ffi.OutlineEntry
+import uniffi.pdfcraft_mobile_ffi.buildInfo
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -88,6 +89,9 @@ fun PdfScreen(viewModel: PdfViewModel, onPickDocument: () -> Unit) {
                 }
             }
         },
+        // Debug aid so a rebuild is provably running the commit it's meant to, not a stale
+        // native library or a stale installed APK — remove once mobile-ffi is past churning.
+        bottomBar = { Text("build ${buildInfo()}", modifier = Modifier.padding(4.dp)) },
     ) { padding ->
         Box(modifier = Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
             when (state) {

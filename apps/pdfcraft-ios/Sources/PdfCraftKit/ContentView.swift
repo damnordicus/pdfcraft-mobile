@@ -20,6 +20,12 @@ public struct PdfCraftRootView: View {
                     findBar
                 }
                 content
+                // Debug aid so a rebuild is provably running the commit it's meant to, not a
+                // stale framework — remove once mobile-ffi is past churning.
+                Text("build \(buildInfo())")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(4)
             }
             .navigationTitle(viewModel.title ?? "PdfCraft")
             .toolbar {
