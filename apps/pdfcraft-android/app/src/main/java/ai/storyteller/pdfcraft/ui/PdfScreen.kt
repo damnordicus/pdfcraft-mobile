@@ -361,12 +361,18 @@ private fun PageView(
                                 val currentBmp = liveBmp ?: return@detectTapGestures
                                 val (ox, oy, ts) = Triple(liveOffsetX, liveOffsetY, liveTotalScale)
                                 val pt = Offset((screen.x - ox) / ts, (screen.y - oy) / ts)
-                                debugText =
+                                // A local val, not shared mutable state: two long-presses in
+                                // quick succession (before the first's background wordAt
+                                // returns) must not let the first's late result clobber onto the
+                                // second's prefix via `debugText +=` — each press reconstructs
+                                // its own full message from its own prefix instead.
+                                val prefix =
                                     "zoom=%.2f base=%.3f total=%.3f box=%dx%d bmp=%dx%d off=(%.0f,%.0f) screen=(%.0f,%.0f) pt=(%.0f,%.0f)"
                                         .format(
                                             liveZoom, liveBaseScale, ts, liveBoxSize.width, liveBoxSize.height,
                                             currentBmp.width, currentBmp.height, ox, oy, screen.x, screen.y, pt.x, pt.y,
                                         )
+                                debugText = prefix
                                 // Off the main thread: this page's text may not be cached yet
                                 // (text_cache, crates/mobile-ffi/src/lib.rs), so this specific
                                 // call — unlike extendSelection below, which only ever runs once
@@ -374,7 +380,8 @@ private fun PageView(
                                 coroutineScope.launch(Dispatchers.Default) {
                                     val found = state.document.wordAt(state.page.toUInt(), pt.x, pt.y, RENDER_SCALE)
                                     val rect = found?.rects?.firstOrNull()
-                                    debugText += " -> word=${found?.text} rect=${rect?.let { "(%.0f,%.0f)-(%.0f,%.0f)".format(it.x0, it.y0, it.x1, it.y1) }}"
+                                    debugText =
+                                        "$prefix -> word=${found?.text} rect=${rect?.let { "(%.0f,%.0f)-(%.0f,%.0f)".format(it.x0, it.y0, it.x1, it.y1) }}"
                                     onSelectionChange(found)
                                 }
                             },
