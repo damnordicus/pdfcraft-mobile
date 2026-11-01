@@ -304,6 +304,13 @@ private fun PageView(
     // wrong glyph from a correct point (the dot would land right on the fingertip, on the wrong
     // word). Remove alongside debugText.
     var lastTouchPoint by remember(state.page) { mutableStateOf<Offset?>(null) }
+    // Temporary, alongside lastTouchPoint: a crop of the *actual displayed bitmap* around the
+    // computed point, cut directly from the same Bitmap object the Image composable draws and
+    // nearest()/word_at() are implicitly queried against via `pt` — no graphicsLayer, no
+    // boxSize/density math, nothing Compose-transform-related in the loop. If this crop shows
+    // different text than what was under the finger, the bug is in the screen-to-bitmap
+    // conversion itself, not in the Rust text lookup or in how the bitmap is displayed.
+    var touchPreview by remember(state.page) { mutableStateOf<Bitmap?>(null) }
 
     LaunchedEffect(state.document, state.page, state.activeMatch) {
         val rendered = withContext(Dispatchers.Default) { state.document.renderPage(state.page.toUInt(), RENDER_SCALE) }
@@ -369,6 +376,15 @@ private fun PageView(
                                 val (ox, oy, ts) = Triple(liveOffsetX, liveOffsetY, liveTotalScale)
                                 val pt = Offset((screen.x - ox) / ts, (screen.y - oy) / ts)
                                 lastTouchPoint = pt
+                                val cropW = 260
+                                val cropH = 90
+                                val cx = pt.x.toInt().coerceIn(0, currentBmp.width - 1)
+                                val cy = pt.y.toInt().coerceIn(0, currentBmp.height - 1)
+                                val left = (cx - cropW / 2).coerceIn(0, (currentBmp.width - cropW).coerceAtLeast(0))
+                                val top = (cy - cropH / 2).coerceIn(0, (currentBmp.height - cropH).coerceAtLeast(0))
+                                val w = cropW.coerceAtMost(currentBmp.width - left)
+                                val h = cropH.coerceAtMost(currentBmp.height - top)
+                                touchPreview = if (w > 0 && h > 0) Bitmap.createBitmap(currentBmp, left, top, w, h) else null
                                 // A local val, not shared mutable state: two long-presses in
                                 // quick succession (before the first's background wordAt
                                 // returns) must not let the first's late result clobber onto the
@@ -396,6 +412,7 @@ private fun PageView(
                             onTap = {
                                 if (state.selection != null) {
                                     lastTouchPoint = null
+                                    touchPreview = null
                                     onSelectionChange(null)
                                 }
                             },
@@ -449,6 +466,13 @@ private fun PageView(
         }
         if (debugText.isNotEmpty()) {
             Text(debugText, modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp), fontSize = 10.sp)
+        }
+        touchPreview?.let { preview ->
+            Image(
+                bitmap = preview.asImageBitmap(),
+                contentDescription = "Bitmap content at the computed touch point",
+                modifier = Modifier.padding(4.dp).background(ComposeColor.Red).padding(2.dp).background(ComposeColor.White),
+            )
         }
         Row(
             modifier = Modifier.padding(16.dp),
