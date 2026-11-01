@@ -10,7 +10,7 @@ or in the Simulator.
 
 ## Build
 
-1. From the repo root (on macOS, with Xcode installed): `cargo xtask mobile ios`. This
+1. From the repo root (on macOS, with Xcode installed): `cargo xtask mobile-ios`. This
    cross-compiles `pdfcraft-mobile-ffi` for device and Simulator, and writes
    `Frameworks/pdfcraft_mobile_ffiFFI.xcframework` and `Sources/PdfCraftFFI/` here — both
    git-ignored, regenerated after any change to `crates/mobile-ffi/src/lib.rs`.

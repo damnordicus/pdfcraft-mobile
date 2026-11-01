@@ -1,4 +1,4 @@
-//! `cargo xtask mobile ios|android`: cross-compile `pdfcraft-mobile-ffi`, generate its Swift/
+//! `cargo xtask mobile-ios`/`mobile-android`: cross-compile `pdfcraft-mobile-ffi`, generate its Swift/
 //! Kotlin bindings (library mode: `uniffi-bindgen` reads them back out of the compiled library,
 //! so there is no `.udl` file to keep in sync with `crates/mobile-ffi/src/lib.rs`), and drop the
 //! result where `apps/pdfcraft-ios`/`apps/pdfcraft-android` expect it.

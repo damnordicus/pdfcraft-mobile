@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "apps/*", "xtask"]
 
 # `apps/*` is a cargo workspace glob; these two are Swift/Kotlin projects (Milestone 1's native
-# mobile apps, built by `cargo xtask mobile ios`/`android`), not Rust crates.
+# mobile apps, built by `cargo xtask mobile-ios`/`mobile-android`), not Rust crates.
 exclude = ["vendor", "apps/pdfcraft-ios", "apps/pdfcraft-android"]
 default-members = ["crates/*", "apps/pdfcraft", "apps/pdfcraft-cli", "xtask"]
 

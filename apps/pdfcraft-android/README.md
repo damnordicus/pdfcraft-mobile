@@ -10,7 +10,7 @@ The Kotlin UI never touches the PDF directly; it calls `MobileDocument` (generat
 ## Build
 
 1. Install an Android NDK and point `$ANDROID_NDK_HOME` at it, and `cargo install cargo-ndk`.
-2. From the repo root: `cargo xtask mobile android`. This cross-compiles `pdfcraft-mobile-ffi` for
+2. From the repo root: `cargo xtask mobile-android`. This cross-compiles `pdfcraft-mobile-ffi` for
    `arm64-v8a`/`armeabi-v7a`/`x86_64` into `app/src/main/jniLibs/`, and generates the Kotlin
    bindings into `app/src/main/java/uniffi/pdfcraft_mobile_ffi/`. Both are git-ignored and must be
    regenerated after any change to `crates/mobile-ffi/src/lib.rs`.
